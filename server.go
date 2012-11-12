@@ -14,6 +14,8 @@ import (
 
 var (
     ServerConnWaitGroup = sync.WaitGroup{}
+    relaunchFnLocal func(uintptr) error
+    debugMode = true
 )
 
 // A ListenAndServe function for running an http server that shuts down
@@ -29,43 +31,27 @@ var (
 // accepting new connections. We then wait for existing connections to close
 // before returning
 func ListenAndServe(addr string, handler http.Handler,
-        relaunchFn func(uintptr) error) (err error) {
-    fmt.Println("In listen and serve")
+        fd uintptr, relaunchFn func(uintptr) error) (err error) {
+    simplelog("In listen and serve")
     // set up server and listener
     server := &http.Server{Addr: addr}
-    listener, listenerErr := net.Listen("tcp", server.Addr)
-    if listenerErr != nil {
-        fmt.Println("Couldn't get tcp listener!")
-        return listenerErr
+    listener, err := getStoppableListener(fd, server.Addr)
+    if err != nil {
+        return err
     }
-    csListener := upgradeListener(listener)
+    relaunchFnLocal = relaunchFn
 
     // Handle signals
     ch := make(chan os.Signal, 1)
     signal.Notify(ch, syscall.SIGHUP)
-    go signalHandler(ch, csListener)
+    signal.Notify(ch, syscall.SIGTERM)
+    go signalHandler(ch, listener)
 
     // Serve content
-    err = server.Serve(csListener)
-    fmt.Println("Server exited, waiting on connections...")
+    err = server.Serve(listener)
+    simplelog("Server exited, waiting on connections...")
     // Wait until remaining connections are closed
     ServerConnWaitGroup.Wait()
-
-    if err == Stopped {
-        fmt.Println("Serve returned with 'Stopped'")
-        // re-launch app on same file descriptor
-        fd, fdErr := noCloseTCPListener(csListener.Listener.(*net.TCPListener))
-        if fdErr != nil {
-            panic("Error getting listener's descriptor: " + fdErr.Error())
-        }
-        fmt.Printf("Relaunching on file descriptor: %d\n", fd)
-        relaunchErr := relaunchFn(fd)
-        if relaunchErr == nil {
-            fmt.Println("Relaunched successfully")
-        } else {
-            fmt.Printf("Relaunch error: '%v'\n", relaunchErr)
-        }
-    }
     return
 }
 
@@ -79,12 +65,8 @@ type signalStruct struct{}
 //     fd int
 // }
 
-var Stopped = errors.New("listener stopped")
-
-type stoppableListener struct {
-    net.Listener 
-    stopForRestart chan signalStruct
-}
+var Stopped = errors.New("stopped gracefully")
+var Restarted = errors.New("restarted gracefully")
 
 // a connection that we're watching to decrement the connection when it 
 type watchedConn struct {
@@ -92,9 +74,9 @@ type watchedConn struct {
 }
 
 func (wc watchedConn) Close() error {
-    fmt.Println("closed a connection")
+    simplelog("closed a connection")
     err := wc.Conn.Close()
-    fmt.Println("-- wait group")
+    simplelog("-- wait group")
     ServerConnWaitGroup.Done()
     return err
 }
@@ -103,17 +85,73 @@ func (wc watchedConn) Close() error {
 // connection counter when it is closed
 func startWatchingConn(c net.Conn) (watchedConn) {
     ServerConnWaitGroup.Add(1)
-    fmt.Println("++ waitgroup")
+    simplelog("++ waitgroup")
     return watchedConn{Conn: c}
 }
 
+//
+// network Listeners
+//
+
+// wrapper around a net.Listener that holds a stop channel on which we can
+// signal it to shut down gracefully
+type stoppableListener struct {
+    net.Listener 
+    underlyingFile *os.File
+    stop chan signalStruct
+    stopForRestart chan signalStruct
+}
+
+// Gets the File from a stoppable Listener.  Assumes it can be cast as a
+// TCPListener
+func (l *stoppableListener) File() (f *os.File, err error) {
+    if l.underlyingFile != nil {
+        simplelog("getting stoppableListener's file, already attached")
+        f = l.underlyingFile
+    } else {
+        simplelog("attaching file copy to stoppableListener")
+        f, err = l.Listener.(*net.TCPListener).File()
+    }
+    return
+}
 
 // Create a new stoppableListener from a regular Listener
 func upgradeListener(l net.Listener) *stoppableListener {
     return &stoppableListener{
         Listener: l,
+        stop: make(chan signalStruct, 1),
         stopForRestart: make(chan signalStruct, 1),
     }
+}
+
+// Get a new stoppableListener, either by creating a new TCPListener or if a
+// valid fd is specified opening a TCP listener on that file descriptor 
+func getStoppableListener(fd uintptr, addr string) (sl *stoppableListener, err error) {
+    var listener net.Listener
+    var f *os.File
+    // listen on already open file
+    if fd != 0 {  
+        simplelogf("Opening file listener on fd: %d\n", fd)
+        f = os.NewFile(uintptr(fd), "listen socket")
+        listener, err = net.FileListener(f)
+        if err != nil {
+            simplelogf("Couldn't open File listener on fd: %d, falling back " +
+                "to new tcp listener\n", fd)
+        }
+    }
+    // if we failed or no file descriptor was given, create new tcp connection
+    if fd == 0 || err != nil {  // create new tcp listener
+        simplelog("Opening a new tcp listener")
+        listener, err = net.Listen("tcp", addr)
+        if err != nil {
+            simplelog("Couldn't get new tcp listener!")
+            return
+        }
+    }
+    sl = upgradeListener(listener)
+    // if we started from an open file, attach it to the listener
+    sl.underlyingFile = f
+    return
 }
 
 // This wrapper for net.Listener's Accept() method does the "heavy lifting" for
@@ -127,28 +165,83 @@ func upgradeListener(l net.Listener) *stoppableListener {
 func (l *stoppableListener) Accept() (c net.Conn, err error) {
     select {
     case <-l.stopForRestart:
-        fmt.Println("received stop signal")
-        err = Stopped
-        return
-    //TODO: case l.stop
-    default:
+        simplelog("received stopForRestart signal")
+        // Keep FD open
+        fd, fdErr := noCloseTCPListener(l)
+        if fdErr != nil {
+            panic("Error getting listener's descriptor: " + fdErr.Error())
+        }
+        // Relaunch the app, using the function specified to do so
+        simplelogf("Relaunching on file descriptor: %d\n", fd)
+        relaunchErr := relaunchFnLocal(fd)
+        if relaunchErr == nil {
+            simplelog("Relaunched successfully")
+        } else {
+            simplelogf("Relaunch error: '%v'\n", relaunchErr)
+        }
+        // close underlying file, if available
+        if l.underlyingFile != nil {
+            fileErr := l.underlyingFile.Close()
+            if fileErr != nil {
+                simplelogf("Error closing stoppableListener's underlying " +
+                    "file: %s\n", fileErr.Error())
+            }
+        }
+        err = Restarted
 
-        fmt.Println("Waiting for request in stoppableListener's Accept()...")
+    case <-l.stop:
+        simplelog("received stop signal")
+        // still keep FD open so we can reattach
+        fd, fdErr := noCloseTCPListener(l)
+        if fdErr != nil {
+            panic("Error getting listener's descriptor: " + fdErr.Error())
+        }
+        simplelogf("Exiting, but leaving fd %d open to reattach to\n", fd)
+        err = Stopped
+
+    default:
+        simplelog("Waiting for request in stoppableListener's Accept()...")
         c, err = l.Listener.Accept()
-        fmt.Println("opened a connection")
+        simplelog("opened a connection")
         if err != nil {
-            fmt.Println("Caught error in underlying tcp listener's Accept()")
+            simplelog("error in underlying tcp listener's Accept()")
             return
         }
         c = startWatchingConn(c)
     }
-    fmt.Println("Returning from stoppableListener's Accept()")
+    simplelog("Returning from stoppableListener's Accept()")
     return
 }
 
+func (l *stoppableListener) Close() error {
+    simplelog("Called Close() on the stoppableListener")
+    return l.Listener.Close()
+}
+
+//
+// Handle OS Signals
+//
+
 // Listen for signals from the OS and send message to stop server
 func signalHandler(ch <-chan os.Signal, l *stoppableListener) {
-    <-ch
-    fmt.Println("Caught signal, stopping after next request...")
-    l.stopForRestart <- signalStruct{}
+    signal := <-ch
+    if signal == syscall.SIGHUP {
+        simplelog("Caught SIGHUP, restarting after next request...")
+        l.stopForRestart <- signalStruct{}
+    } else if signal == syscall.SIGTERM {
+        simplelog("Caught SIGTERM, stopping after next request...")
+        l.stop <- signalStruct{}
+    }
+}
+
+// Simple log wrappers that only log if debugging is on
+func simplelogf(s string, args... interface{}) {
+    if debugMode {
+        fmt.Printf(s, args)
+    }
+}
+func simplelog(s string) {
+    if debugMode {
+        fmt.Println(s)
+    }
 }

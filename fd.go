@@ -6,7 +6,7 @@ package gracefulserver
 
 import (
     "fmt"
-    "net"
+    // "net"
     "syscall"
 )
 
@@ -15,26 +15,31 @@ import (
 //
 // from syscall/zsyscall_linux_386.go, but it seems like it might work
 // for other platforms too.
-func fcntl(fd int, cmd int, arg int) (val int, err error) {
-        r0, _, e1 := syscall.Syscall(syscall.SYS_FCNTL, uintptr(fd), uintptr(cmd), uintptr(arg))
-        val = int(r0)
-        if e1 != 0 {
-                err = e1
-        }
-        return
+func fcntl(fd uint, cmd int, arg int) (val int, err error) {
+    r0, _, e1 := syscall.Syscall(syscall.SYS_FCNTL, uintptr(fd), uintptr(cmd), uintptr(arg))
+    val = int(r0)
+    if e1 != 0 {
+        err = e1
+    }
+    return
 }
 
-func noCloseOnExec(fd uintptr) {
-        fcntl(int(fd), syscall.F_SETFD, ^syscall.FD_CLOEXEC)
+func noCloseOnExec(fd uintptr) (err error) {
+    _, err = fcntl(uint(fd), syscall.F_SETFD, ^syscall.FD_CLOEXEC)
+    return
 }
 
 // Prevent the filedescriptor attached to a TCPListener from closing
-func noCloseTCPListener(l *net.TCPListener) (uintptr, error) {
-    fdObj, err := l.File()
-    fd := fdObj.Fd()
+func noCloseTCPListener(l *stoppableListener) (uintptr, error) {
+    file, err := l.File()
+    fd := file.Fd()
+    fmt.Printf("Looked up file descriptor: %v\n", fd)
     if err != nil {
-        fmt.Printf("FD error for fd: %d (ignoring)\n", fd)
+        fmt.Printf("FD error for fd %d: %v \n", fd, err)
     }
-    noCloseOnExec(fd)
+    err = noCloseOnExec(fd)
+    if err != nil {
+        fmt.Printf("noCloseOnExec error: %v\n", err)
+    }
     return fd, nil
 }
