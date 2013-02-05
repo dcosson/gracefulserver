@@ -181,6 +181,7 @@ func (l *stoppableListener) Accept() (c net.Conn, err error) {
         }
         // close underlying file, if available
         if l.underlyingFile != nil {
+            simplelogf("Closing underlying file: %v\n", l.underlyingFile)
             fileErr := l.underlyingFile.Close()
             if fileErr != nil {
                 simplelogf("Error closing stoppableListener's underlying " +
